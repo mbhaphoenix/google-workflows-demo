@@ -1,0 +1,82 @@
+main:
+  params: [args]
+  steps:
+    - set:
+        assign:
+          - project_id: ${sys.get_env("GOOGLE_CLOUD_PROJECT_ID")}
+    - get_ts:
+        call: bq_runner
+        args:
+          sql: ${args}
+        result: bq_ts
+    - insert_in_fs: 
+        call: googleapis.firestore.v1.projects.databases.documents.patch
+        args:
+          name: ${"projects/" + project_id + "/databases/(default)/documents/coffees/doc"}
+          body:
+            fields: 
+              status: 
+                stringValue: NICE
+              ts: 
+                timestampValue: ${bq_ts + "Z"}
+
+bq_runner:
+  params: [sql]
+  steps:
+  - init:
+      assign: 
+        - project_id: ${sys.get_env("GOOGLE_CLOUD_PROJECT_ID")}
+        - job_id:       
+  - trying:
+      try:
+        steps: 
+          - bq_jobs_insert:
+              call: http.post
+              args:
+                url: ${"https://bigquery.googleapis.com/bigquery/v2/projects/" + project_id + "/jobs"}
+                body: 
+                  jobReference:
+                    location: EU
+                  configuration:
+                    query:
+                      useLegacySql: false
+                      useQueryCache: false
+                      query: ${sql}
+                auth: 
+                  type: OAuth2
+              result: bq_jobs_insert_resp
+          - set_job_id:
+              assign:
+                - job_id: ${bq_jobs_insert_resp.body.jobReference.jobId}
+          - bq_jobs_get_result: 
+              call: http.get
+              args:
+                url: ${"https://bigquery.googleapis.com/bigquery/v2/projects/" + project_id + "/queries/" + job_id}
+                auth: 
+                  type: OAuth2
+              result: bq_jobs_get_result_resp
+          - check_job_complete:
+              switch:
+                - condition: ${not(bq_jobs_get_result_resp.body.jobComplete)}
+                  steps:
+                    - log_while_waiting:
+                        call: sys.log
+                        args: 
+                          text: "Waiting for 10 seconds before rechecking"
+                          severity: WARNING
+                    - wait_10_seconds:
+                        call: sys.sleep
+                        args:
+                          seconds: 10
+                        next: bq_jobs_get_result
+          - return_result:
+              return: ${bq_jobs_get_result_resp.body.rows[0].f[0].v}
+      except: 
+        as: err
+        steps: 
+          - handle_knowns_errors:
+              switch: 
+                - condition: ${int(err.code)>= 400 }
+                  return:  "shit bad request"
+          - handle_unknown:
+              raise: ${err}
